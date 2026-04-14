@@ -1721,9 +1721,12 @@ class StableDiffusionXLInpaintPipeline(
             image_embeds = self.prepare_ip_adapter_image_embeds(
                 ip_adapter_image, device, batch_size * num_images_per_prompt
             )
-
-            #project outside for loop
-            image_embeds = self.unet.encoder_hid_proj(image_embeds).to(prompt_embeds.dtype)
+            # Defer encoder_hid_proj until inside the loop so sequential_cpu_offload
+            # has moved unet to GPU before we call it.
+            _ip_image_embeds_raw = image_embeds
+            image_embeds = None  # will be projected on first loop iteration
+        else:
+            _ip_image_embeds_raw = None
 
 
         # 11. Denoising loop
@@ -1779,21 +1782,46 @@ class StableDiffusionXLInpaintPipeline(
                 # if num_channels_unet == 9:
                 #     latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
 
+                # Project ip-adapter image embeds on first iteration.
+                # encoder_hid_proj may be on CPU (offload hook only fires during unet.forward).
+                # Run projection where the layer lives, then move result to target device.
+                if _ip_image_embeds_raw is not None and image_embeds is None:
+                    _proj_device = next(self.unet.encoder_hid_proj.parameters()).device
+                    image_embeds = self.unet.encoder_hid_proj(
+                        _ip_image_embeds_raw.to(device=_proj_device, dtype=next(self.unet.encoder_hid_proj.parameters()).dtype)
+                    ).to(device=device, dtype=prompt_embeds.dtype)
+
                 # predict the noise residual
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 if ip_adapter_image is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
                 # down,reference_features = self.UNet_Encoder(cloth,t, text_embeds_cloth,added_cond_kwargs= {"text_embeds": pooled_prompt_embeds_c, "time_ids": add_time_ids},return_dict=False)
-                down,reference_features = self.unet_encoder(cloth,t, text_embeds_cloth,return_dict=False)
-                # print(type(reference_features))
-                # print(reference_features)
+                # Alternating GPU strategy for 8 GB VRAM (unet ~6 GB + encoder ~5 GB > 8 GB):
+                # 1) Unload unet from GPU  2) Load encoder  3) Run  4) Unload encoder  5) unet returns to GPU via hook
+                _enc_on_cpu = not next(self.unet_encoder.parameters()).is_cuda
+                if _enc_on_cpu:
+                    # Temporarily move unet to CPU to free VRAM
+                    self.unet.to('cpu')
+                    torch.cuda.empty_cache()
+                    self.unet_encoder.to(device)
+                    torch.cuda.empty_cache()
+                down, reference_features = self.unet_encoder(
+                    cloth.to(device), t.to(device),
+                    text_embeds_cloth.to(device),
+                    return_dict=False,
+                )
                 reference_features = list(reference_features)
-                # print(len(reference_features))
-                # for elem in reference_features:
-                #     print(elem.shape)
-                # exit(1)
                 if self.do_classifier_free_guidance:
                     reference_features = [torch.cat([torch.zeros_like(d), d]) for d in reference_features]
+                # Move features to CPU, then swap: encoder→CPU, unet→GPU
+                reference_features = [feat.cpu() for feat in reference_features]
+                if _enc_on_cpu:
+                    self.unet_encoder.to('cpu')
+                    torch.cuda.empty_cache()
+                    self.unet.to(device)
+                    torch.cuda.empty_cache()
+                # Move features to GPU for unet
+                reference_features = [feat.to(device=device, dtype=self.unet.dtype) for feat in reference_features]
 
 
                 noise_pred = self.unet(

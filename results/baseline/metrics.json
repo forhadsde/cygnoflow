@@ -1,0 +1,14 @@
+{
+  "mode": "baseline",
+  "dtype": "float16",
+  "resolution": "768x1024",
+  "steps": 30,
+  "guidance_scale": 2.0,
+  "attention_slicing": false,
+  "vae_slicing": false,
+  "cpu_offload": "manual_alternating",
+  "vram_peak_gb": 6.63,
+  "load_time_s": 10.9,
+  "inference_time_s": 160.1,
+  "output": "/home/rey/cygnoflow/results/baseline/tryon_output.png"
+}
